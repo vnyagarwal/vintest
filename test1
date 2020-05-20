@@ -1,0 +1,1934 @@
+#!/usr/bin/env python3
+
+# Standard imports
+from distutils.version import LooseVersion
+from xml.etree import ElementTree
+from zipfile import ZipFile
+import glob
+import os
+import pickle
+import re
+import shutil
+import tarfile
+
+# Internal imports
+from console import APPLICATION_PROPERTIES_PATH
+from console import APP_NAME
+from console import DATABASE
+from console import FILE_TRANSFER
+from console import FULL_NAME
+from console import SERVICES
+from console import SYSTEM_SERVICES
+from console import Services
+from console import StandardUsers
+from console import SystemServices
+from console import VERSION
+from console import _
+from console import application_properties
+from console import configure_application_settings
+from console import fileutil
+from console import get_locale_from_legacy_language
+from console import logger
+from console import postgresql_version
+from console.appconfiguration import ComplianceReporterApplicationConfigurationModel
+from console.appconfiguration import CoreServerApplicationConfigurationModel
+from console.appconfiguration import CoreServerEntityDataAccessObjectsModel
+from console.appconfiguration import CoreServerProxyApplicationConfigurationModel
+from console.appconfiguration import ForensicServerApplicationConfigurationModel
+from console.appconfiguration import IdentityServerApplicationConfigurationModel
+from console.appconfiguration import InventoryServerApplicationConfigurationModel
+from console.appconfiguration import SecurityServerApplicationConfigurationModel
+from console.certificate import JavaKeyStore
+from console.certificate import LegacyCertificatePropertiesModel
+from console.cron import Crontab
+from console.database import DatabaseAccessRestoreController
+from console.database import PostgreSQLBackupModel
+from console.database import PostgreSQLConfigurationModel
+from console.database import PostgreSQLHostBasedAuthenticationModel
+from console.logrotate import LegacyLogrotateScheduleModel
+from console.logrotate import LogrotateScheduleModel
+from console.network import HostModel
+from console.network import LegacySFTPUserModel
+from console.network import NetworkModel
+from console.network import NetworkProtocol
+from console.network import SSHAccessModel
+from console.network import StaticIPModel
+from console.network import UserModel
+from console.network import configure_java_network_stack_preferences
+from console.notification import EmailNotificationModel
+from console.notification import LegacyEmailNotificationModel
+from console.notification import NagiosDdsCfgFileModel
+from console.properties import Properties
+from console.service import Systemd
+from console.service import SystemdTimerModel
+from console.service import start_all_services_in_background
+from console.service import stop_all_services
+from console.shell import Shell
+from console.systemdashboard import VersionHistoryModel
+from console.timeutil import Calendar
+from console.timeutil import DateTime
+from console.timeutil import DayOfWeek
+from console.timeutil import Schedule
+from console.timezone import TimeZoneModel
+from console.ufw import UFW
+from console.ui import ActionButtons
+from console.ui import Align
+from console.ui import Controller
+from console.ui import DropDown
+from console.ui import EditBox
+from console.ui import FileModel
+from console.ui import FileSelectionForm
+from console.ui import FormButtons
+from console.ui import InputForm
+from console.ui import IntEditBox
+from console.ui import Model
+from console.ui import Palette
+from console.ui import ProgressMessageForm
+from console.ui import RadioButtonGroup
+from console.ui import Space
+from console.ui import Text
+from console.validation import HourMinuteValidator
+from console.validation import IntRangeValidator
+
+
+class BackupModel(Model):
+    DEFAULT_BACKUP_FOLDER = FILE_TRANSFER['backup']
+    DEFAULT_BACKUP_FILE_PATTERN = "{application_name}_{version}_backup_{time_stamp}.tgz"
+
+    BACKUP_MANIFEST = {
+        'Administration Console': [
+            '/etc/opt/dell/console/application.properties*',
+            '/opt/dell/version.xml'
+        ],
+        'Certificates': [
+            '/etc/postfix/ssl/*',
+            '/opt/dell/CA/ca.crt*',
+            '/opt/dell/CA/ca.key*',
+            '/opt/dell/CA/ca.srl*',
+            '/opt/dell/CA/cacerts*',
+            '/opt/dell/server/core-server-proxy/conf/cacerts*',
+            '/opt/dell/server/forensic-server/conf/cacerts*',
+            '/opt/dell/server/local-server/conf/cacerts*',
+            '/opt/dell/server/reporter/conf/cacerts*',
+            '/opt/dell/server/security-server/conf/cacerts*'
+        ],
+        'Firewall': [
+            '/etc/ufw/user.rules*',
+            '/etc/ufw/user6.rules*'
+        ],
+        'Postfix': [
+            '/etc/postfix/main.cf*',
+            '/etc/postfix/sasl_passwd*',
+            '/etc/postfix/sasl_passwd.db*'
+        ],
+        'PostgreSQL': [
+            '/etc/postgresql/*/main/pg_hba.conf*',
+            '/etc/postgresql/*/main/postgresql.conf*'
+        ],
+        'Scheduling': [
+            '/etc/systemd/system/dell-backup.timer',
+            '/etc/systemd/system/dell-log-rotation.timer',
+            '/etc/systemd/system/dell-summary-report.timer'
+        ],
+        'System': [
+            '/etc/apt/apt.conf.d/99dsmsv',
+            '/etc/apt/apt.conf.d/99force-ipv4',
+            '/etc/crontab*',
+            '/etc/hostname*',
+            '/etc/hosts*',
+            '/etc/issue*',
+            '/etc/logrotate.d/dds',
+            '/etc/nagios3/conf.d/dds.cfg',
+            '/etc/network/interfaces*',
+            '/etc/passwd*',
+            '/etc/shadow*',
+            '/etc/sysctl.d/999-dsmsv.conf*',
+            '/etc/ssh/sshd_config*',
+            '/etc/timezone*'
+        ],
+        SERVICES[Services.COMPATIBILITY_SERVER]['name']: [
+            '/opt/dell/server/compatibility-server/conf/application.properties*',
+            '/opt/dell/server/compatibility-server/conf/secretKeyStore*',
+            '/opt/dell/server/compatibility-server/logs/*.log*'
+        ],
+        SERVICES[Services.COMPLIANCE_REPORTER]['name']: [
+            '/opt/dell/server/reporter/conf/application.properties*',
+            '/opt/dell/server/reporter/conf/db.properties*',
+            '/opt/dell/server/reporter/conf/eserver.properties*',
+            '/opt/dell/server/reporter/conf/keyStore.properties*',
+            '/opt/dell/server/reporter/logs/*.log*',
+            '/opt/dell/server/reporter/reporterBackup.zip*'
+        ],
+        SERVICES[Services.CORE_SERVER]['name']: [
+            '/opt/dell/server/core-server-proxy/conf/application.properties*',
+            '/opt/dell/server/core-server-proxy/logs/*.log*',
+            '/opt/dell/server/core-server/Application.properties*',
+            '/opt/dell/server/core-server/Database.properties*',
+            '/opt/dell/server/core-server/EntityDataAccessObjects.config*',
+            '/opt/dell/server/core-server/Logs/*.log*'
+        ],
+        SERVICES[Services.FORENSIC_SERVER]['name']: [
+            '/opt/dell/server/forensic-server/conf/application.properties*',
+            '/opt/dell/server/forensic-server/conf/db.properties*',
+            '/opt/dell/server/forensic-server/logs/*.log*'
+        ],
+        SERVICES[Services.IDENTITY_SERVER]['name']: [
+            '/opt/dell/server/local-server/conf/application.properties*',
+            '/opt/dell/server/local-server/conf/db.properties*',
+            '/opt/dell/server/local-server/logs/*.log*'
+        ],
+        SERVICES[Services.INVENTORY_SERVER]['name']: [
+            '/opt/dell/server/inventory-server/Application.properties*',
+            '/opt/dell/server/inventory-server/Database.properties*',
+            '/opt/dell/server/inventory-server/Logs/*.log*'
+        ],
+        SERVICES[Services.MESSAGE_BROKER]['name']: [
+            '/opt/dell/server/message-broker/conf/application.properties*',
+            '/opt/dell/server/message-broker/conf/db.properties*',
+            '/opt/dell/server/message-broker/logs/*.log*'
+        ],
+        SERVICES[Services.POLICY_PROXY]['name']: [
+            '/home/delluser/wine/drive_c/opt/dell/proxy/GKConsole/logs/*.log*',
+        ],
+        SERVICES[Services.SECURITY_SERVER]['name']: [
+            '/opt/dell/server/security-server/conf/application.properties*',
+            '/opt/dell/server/security-server/conf/db.properties*',
+            '/opt/dell/server/security-server/conf/device-access.xml*',
+            '/opt/dell/server/security-server/conf/registration-access.xml*',
+            '/opt/dell/server/security-server/conf/webdefault.xml*',
+            '/opt/dell/server/security-server/logs/*.log*',
+            '/opt/dell/server/security-server/logs/siem/*.log*',
+        ]
+    }
+
+    def __init__(self, on_append_message=None):
+        super().__init__(on_append_message=on_append_message)
+
+    def purge_old_backup_files(self, backup_file_count_limit=9):
+        # backup_file_count_limit defaults to 9, because we expect to create a new backup file, which will be the 10th.
+
+        # Get list of all backup files in the backup folder.
+        files = glob.glob("{backup_folder}/{application_name}_*_backup_*.tgz".format(backup_folder=self.DEFAULT_BACKUP_FOLDER, application_name=APP_NAME))
+        # Reverse sort by creation date.
+        files.sort(key=os.path.getctime, reverse=True)
+
+        # If we need to purge old backup files, ensure there's a record of it and notify the user in the UI.
+        if len(files[backup_file_count_limit:]):
+            logger.info(msg="Purging old backup files...")
+            self.append_message(message=_("Purging old backup files..."))
+
+            for file in files[backup_file_count_limit:]:
+                message = "  {file_path}".format(file_path=file)
+                logger.info(msg=message)
+                self.append_message(message=message)
+                # Delete the file.
+                os.unlink(path=file)
+
+    def save(self):
+        backup_time_stamp = DateTime.time_stamp_string()
+
+        # Formulate the backup file path.
+        backup_file_name = self.DEFAULT_BACKUP_FILE_PATTERN.format(application_name=APP_NAME, version=VERSION, time_stamp=backup_time_stamp)
+        backup_file_path = "{backup_directory}/{backup_file_name}".format(backup_directory=self.DEFAULT_BACKUP_FOLDER, backup_file_name=backup_file_name)
+
+        # Ensure we're below the backup file limit before creating a new one.
+        self.purge_old_backup_files()
+        
+        with tarfile.open(name=backup_file_path, mode='w:gz') as backup_file:
+            # Archive static files.
+            for category in self.BACKUP_MANIFEST.keys():
+                logger.info(msg="Archiving {category} data...".format(category=category))
+                self.append_message(message=_("Archiving {category} data...").format(category=category))
+                for file_glob in [glob.glob(file_path) for file_path in self.BACKUP_MANIFEST[category]]:
+                    for file_path in file_glob:
+                        message = "  {file_path}".format(file_path=file_path)
+                        logger.info(msg=message)
+                        self.append_message(message=message)
+                        backup_file.add(name=file_path)
+
+            # Delete any leftover database backup files.
+            for temp_file in glob.glob(pathname='/tmp/dsmsv_*'):
+                os.unlink(path=temp_file)
+
+            # Generate database backups for all known schemas
+            for schema in DATABASE['schemas'].values():
+                logger.info(msg="Creating backup of {schema} database schema...".format(schema=schema))
+                self.append_message(message=_("Creating backup of {schema} database schema...").format(schema=schema))
+                exit_code, stdout, stderr = Shell.run(
+                    args=[
+                        '/opt/dell/console/pydatabase.py',
+                        '--backup', schema
+                    ]
+                )
+
+                if exit_code:
+                    logger.error(msg="Failed to create backup of {schema} database schema:\n{stderr}".format(schema=schema, stderr=stderr))
+                    raise RuntimeError(_("Failed to create backup of {schema} database schema.").format(schema=schema))
+
+            logger.info(msg='Archiving database backups...')
+            self.append_message(message=_('Archiving database backups...'))
+            for file_path in glob.glob(pathname=DATABASE['backup_file_path_glob']):
+                message = "  {file_path}".format(file_path=file_path)
+                logger.info(msg=message)
+                self.append_message(message=message)
+                backup_file.add(name=file_path)
+
+        return backup_file_path
+
+
+class BackupController(Controller):
+    FORM_ID = 'BACKUP'
+
+    def __init__(self, application):
+        super().__init__(application=application)
+
+        self._model = BackupModel(on_append_message=self.append_message)
+
+        self._view = self._application.register(id=self.FORM_ID, view=ProgressMessageForm(controller=self, name=_('Backup')))
+
+    def load(self):
+        try:
+            backup_file_path = self._model.save()
+            self.save(backup_file_path=backup_file_path)
+        except Exception as error:
+            logger.error(msg="Failed to create backup file:\n{error}".format(error=str(error)))
+            self._view.open_confirmation_dialog(
+                title=_('Backup'),
+                message=_('Failed to create backup file. See Administration Console logs for details.'),
+                on_cancel=None,
+                on_ok=self._view.on_cancel,
+                ok_label=_('OK')
+            )
+
+    def save(self, backup_file_path=None):
+        if backup_file_path is not None:
+            logger.info(msg="Backup file created:\n\n{backup_file_path}".format(backup_file_path=backup_file_path))
+            self._view.open_confirmation_dialog(
+                title=_('Backup'),
+                message=_("Backup file created:\n\n{backup_file_path}").format(backup_file_path=backup_file_path),
+                on_cancel=None,
+                on_ok=self._view.on_ok,
+                ok_label=_('OK')
+            )
+        # Else, some code invoked save() without a valid argument. Developer error.
+
+
+class LegacyBackupScheduleModel(FileModel):
+    def __init__(self, file_path, backup_time_stamp=DateTime.time_stamp_string()):
+        super().__init__(file_path=file_path, backup_time_stamp=backup_time_stamp)
+
+        self.schedule = Schedule.DAILY.value
+        self.day_of_the_week = DayOfWeek.SATURDAY.value
+        self.day_of_the_month = 12
+        self.time = '23:57'
+
+    def load(self):
+        # TODO: Migrate this code to use the console.fileutil.PickleFileModel class. Not doing it now to avoid potential
+        #       regression. If a defect is filed for issues related to corrupted pickle file not being handled
+        #       correctly, then use the implementation of console.notification.LegacyEmailNotificationModel.load() as
+        #       a sample.
+        with open(self.file_path) as backup_cfg:
+            backup_cfg_dict = pickle.loads(backup_cfg.read().encode())
+
+            if backup_cfg_dict['noback']:
+                self.schedule = Schedule.NONE.value
+            elif backup_cfg_dict['daily']:
+                self.schedule = Schedule.DAILY.value
+            elif backup_cfg_dict['weekly']:
+                self.schedule = Schedule.WEEKLY.value
+            elif backup_cfg_dict['monthly']:
+                self.schedule = Schedule.MONTHLY.value
+            else:
+                self.schedule = Schedule.NONE.value
+
+            # Normalize the "day of the week" value in case the non-standard value of '7' is used for Sunday.
+            day_of_the_week = int(backup_cfg_dict['dayofweek'])
+            if day_of_the_week not in list(range(7)):
+                day_of_the_week = DayOfWeek.SUNDAY.value
+
+            self.day_of_the_week = day_of_the_week
+            self.day_of_the_month = int(backup_cfg_dict['dayofmonth'])
+            self.time = backup_cfg_dict['time']
+
+
+class BackupScheduleModel(Model):
+    def __init__(self, on_append_message=None):
+        super().__init__(on_append_message=on_append_message)
+
+        self.schedule = Schedule.DAILY.value
+        self.day_of_the_week = DayOfWeek.SATURDAY.value
+        self.day_of_the_month = 12
+        self.time = '23:57'
+
+    def load(self):
+        self.schedule = Schedule.value_of(application_properties['backup.schedule']) if application_properties['backup.schedule'] else Schedule.DAILY.value
+        self.day_of_the_week = DayOfWeek.value_of(application_properties['backup.day_of_the_week']) if application_properties['backup.day_of_the_week'] is not None else DayOfWeek.SATURDAY.value
+        self.day_of_the_month = int(application_properties['backup.day_of_the_month']) if application_properties['backup.day_of_the_month'] is not None else 12
+        self.time = application_properties['backup.time'] if application_properties['backup.time'] is not None else '23:57'
+
+    def save(self):
+        application_properties['backup.schedule'] = Schedule.name_of(self.schedule)
+        application_properties['backup.day_of_the_week'] = DayOfWeek.name_of(value=self.day_of_the_week)
+        application_properties['backup.day_of_the_month'] = self.day_of_the_month
+        application_properties['backup.time'] = self.time
+
+        application_properties.save()
+
+
+class BackupScheduleForm(InputForm):
+    def __init__(self, controller):
+        super().__init__(controller=controller, name=_('Backup'))
+
+        self._schedule = self.add(RadioButtonGroup, group_name=_('Backup Schedule'), tool_tip=_('Use spacebar to select periodic backup policy.'))
+        self._schedule.add(label=_('No backups'))
+        self._schedule.add(label=_('Daily'), state=True)
+        self._schedule.add(label=_('Weekly'))
+        self._schedule.add(label=_('Monthly'))
+        self._day_of_the_week = self.add(DropDown, label=_('Day of Week'), items=list(Calendar.localized_day_names()), tool_tip=_('Select day of week when periodic backup should be done.'))
+        self._day_of_the_month = self.add(IntEditBox, label=_('Day of Month'), value=10, tool_tip=_('Enter day of month when periodic backup should be done. (Range between 1 - 31)'), validators=[IntRangeValidator(min_value=1, max_value=31)])
+        self._time = self.add(EditBox, label=_('Backup Time'), text='23:29', tool_tip=_('Enter time (in 24-hour HH:MM format) at which backup should be done.'), validators=[HourMinuteValidator()])
+
+        self.add(FormButtons, on_ok=self.on_ok, on_cancel=self.on_cancel)
+
+    @property
+    def schedule(self):
+        return self._schedule.selected_index
+
+    @schedule.setter
+    def schedule(self, index):
+        self._schedule.selected_index = index
+        self._invalidate()
+
+    @property
+    def day_of_the_week(self):
+        return self._day_of_the_week.selected_index
+
+    @day_of_the_week.setter
+    def day_of_the_week(self, value):
+        self._day_of_the_week.selected_index = value
+        self._invalidate()
+
+    @property
+    def day_of_the_month(self):
+        return self._day_of_the_month.value
+
+    @day_of_the_month.setter
+    def day_of_the_month(self, value):
+        self._day_of_the_month.value = value
+        self._invalidate()
+
+    @property
+    def time(self):
+        return self._time.text
+
+    @time.setter
+    def time(self, value):
+        self._time.text = value
+        self._invalidate()
+
+
+class BackupScheduleController(Controller):
+    FORM_ID = 'BACKUP_SCHEDULE'
+
+    def __init__(self, application):
+        super().__init__(application=application)
+
+        self._model = BackupScheduleModel()
+
+        self._view = self._application.register(id=self.FORM_ID, view=BackupScheduleForm(controller=self))
+
+    def load(self):
+        self._model.load()
+
+        self._view.schedule = self._model.schedule
+        self._view.day_of_the_week = self._model.day_of_the_week
+        self._view.day_of_the_month = self._model.day_of_the_month
+        self._view.time = self._model.time
+
+    def save(self):
+        self._model.schedule = self._view.schedule
+        self._model.day_of_the_week = self._view.day_of_the_week
+        self._model.day_of_the_month = self._view.day_of_the_month
+        self._model.time = self._view.time
+
+        self._model.save()
+
+        backup_timer = SystemdTimerModel(file_path='/etc/systemd/system/dell-backup.timer')
+        backup_timer.load()
+        backup_timer.is_enabled = self._model.schedule != Schedule.NONE
+        backup_timer.schedule = self._model.schedule
+        backup_timer.day_of_week = DayOfWeek.from_value(value=self._model.day_of_the_week)
+        backup_timer.day_of_month = self._model.day_of_the_month
+        # TODO: Need to add validation or divide time components into separate class properties.
+        backup_timer.time_string = "{time}:00".format(time=self._model.time)
+        backup_timer.save()
+
+
+class RestoreModelBase(Model):
+    DEFAULT_BACKUP_FOLDER = FILE_TRANSFER['backup']
+
+    def __init__(self, backup_file_path, on_append_message=None):
+        super().__init__(on_append_message=on_append_message)
+
+        # Prevent supplying None
+        if backup_file_path is None:
+            raise ValueError(_('Missing backup file path.'))
+
+        self.backup_file_path = backup_file_path
+        self.application_properties_backup_file_path = None
+
+        # Attempted to restore from a non-existent file.
+        if not os.path.isfile(path=self.backup_file_path):
+            raise FileNotFoundError("Backup file does not exist: {backup_file_path}".format(backup_file_path=self.backup_file_path))
+
+        self.live_models = []
+
+    def save(self):
+        try:
+            self.append_message(message=_('Stopping all services...'))
+            stop_all_services()
+            self.restore()
+            self.append_message(message=_('Restarting database...'))
+            Systemd.restart_unit(unit_name=SYSTEM_SERVICES[SystemServices.POSTGRESQL]['unit'])
+        except Exception as e:
+            self.rollback()
+            self.append_message(
+                message=_("Failed to restore from backup file: {backup_file}".format(backup_file=self.backup_file_path)),
+                in_failure_state=True
+            )
+            raise e
+
+    def register_live_model(self, model):
+        model.create_backup()
+        self.live_models.append(model)
+        return model
+
+    def create_restore_model(self, cls, backup_file, tar_member):
+        backup_file.extract(member=tar_member, path='/tmp')
+        restore_file_path = "/tmp/{file_path}".format(file_path=tar_member)
+        model = cls(file_path=restore_file_path)
+        return model
+
+    def _overwrite_existing(self, backup_file, tar_member, time_stamp):
+        target_file_path = "/{file_path}".format(file_path=tar_member)
+
+        # Ensure tar_member is actually a file. tarfile entries can be directories, which cause the workflow to fail
+        # without this if condition.
+        if os.path.isfile(path=target_file_path):
+            fileutil.backup(src=target_file_path, time_stamp=time_stamp)
+
+        backup_file.extract(member=tar_member, path='/')
+        fileutil.chown(path=target_file_path)
+
+    def restore(self):
+        pass
+
+    def rollback(self):
+        for model in self.live_models:
+            model.revert()
+
+        logger.error(
+            msg="Reverting changes:  {backup_file_path} => {file_path}".format(
+                backup_file_path=self.application_properties_backup_file_path,
+                file_path=APPLICATION_PROPERTIES_PATH
+            )
+        )
+        fileutil.move(src=self.application_properties_backup_file_path, dst=APPLICATION_PROPERTIES_PATH)
+        application_properties = Properties(file_name=APPLICATION_PROPERTIES_PATH)
+        configure_application_settings(properties=application_properties)
+
+        # Bring everything back up.
+        Systemd.start_unit(unit_name=SYSTEM_SERVICES[SystemServices.POSTGRESQL]['unit'])
+        start_all_services_in_background()
+        Crontab.restart()
+
+
+class LegacyRestoreModel(RestoreModelBase):
+    LEGACY_UPGRADE_PATH_VERSION = '9.10.1'
+    DEFAULT_MATCH_PATTERN = r'^ddp_9_10_1_fullback_.*\.tar\.gz$'
+
+    def __init__(self, backup_file_path, on_append_message=None):
+        super().__init__(backup_file_path=backup_file_path, on_append_message=on_append_message)
+
+        # Attempt to restore an unsupported file.
+        if not re.match(pattern=self.DEFAULT_MATCH_PATTERN, string=os.path.basename(self.backup_file_path)):
+            raise RuntimeError(_('Attempted to restore from an unsupported backup file. A restore can only be done from a 9.10.1+ backup file.'))
+
+    @staticmethod
+    def backup_files():
+        files = [
+            os.path.join(dirpath, file)
+            for dirpath, dirnames, filenames in os.walk(top=RestoreModelBase.DEFAULT_BACKUP_FOLDER)
+            for file in filenames if re.match(pattern=LegacyRestoreModel.DEFAULT_MATCH_PATTERN, string=file)
+        ]
+        return sorted(files, reverse=True)
+
+    # NOTE: This function is really big. We might want to consider breaking it up in to smaller functions.
+    def restore(self):
+        self.append_message(message=_("Starting restore from legacy backup file: {backup_file}").format(backup_file=self.backup_file_path))
+
+        backup_time_stamp = DateTime.time_stamp_string()
+
+        self.application_properties_backup_file_path = fileutil.backup(src=APPLICATION_PROPERTIES_PATH, time_stamp=backup_time_stamp)
+
+        with tarfile.open(name=self.backup_file_path) as backup_file:
+            for tar_member in backup_file.getnames():
+                if tar_member.startswith('etc/nagios3/'):
+                    # TODO: Complete with e-mail notifications work.
+                    pass
+
+                # Network configuration.
+                elif tar_member == 'etc/network/interfaces':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    live_model = self.register_live_model(model=NetworkModel(backup_time_stamp=backup_time_stamp))
+                    restore_model = self.create_restore_model(cls=NetworkModel, backup_file=backup_file, tar_member=tar_member)
+
+                    live_model.load()
+                    restore_model.load()
+
+                    live_model.enable_ipv4_support = restore_model.enable_ipv4_support
+                    live_model.ipv4_use_dhcp = restore_model.ipv4_use_dhcp
+                    live_model.ipv4_static_ip_model = restore_model.ipv4_static_ip_model
+                    live_model.enable_ipv6_support = False
+                    live_model.ipv6_use_dhcp = False
+                    live_model.ipv6_static_ip_model = StaticIPModel(NetworkProtocol.IPV6)
+
+                    live_model.save()
+                    configure_java_network_stack_preferences(prefer_ipv6=False)
+
+                # Postfix.
+                elif tar_member.startswith('etc/postfix/'):
+                    # TODO: Complete with e-mail notifications work.
+                    pass
+
+                # PostgreSQL.
+                elif tar_member.startswith('etc/postgresql/9.5/') and 9.5 < postgresql_version():
+                    if re.match(pattern=r'etc/postgresql/.*/main/pg_hba.conf', string=tar_member):
+                        live_model = self.register_live_model(model=PostgreSQLHostBasedAuthenticationModel())
+                        restore_model = self.create_restore_model(
+                            cls=PostgreSQLHostBasedAuthenticationModel,
+                            backup_file=backup_file, tar_member=tar_member
+                        )
+
+                        restore_model.load()
+                        live_model.ipv4_remote_access_enabled = restore_model.ipv4_remote_access_enabled
+                        live_model.ipv6_remote_access_enabled = restore_model.ipv6_remote_access_enabled
+                        live_model.save()
+
+                    elif re.match(pattern=r'etc/postgresql/.*/main/postgresql.conf', string=tar_member):
+                        live_model = self.register_live_model(model=PostgreSQLConfigurationModel())
+                        restore_model = self.create_restore_model(
+                            cls=PostgreSQLConfigurationModel,
+                            backup_file=backup_file, tar_member=tar_member
+                        )
+
+                        restore_model.load()
+                        live_model.listen_to_all_addresses = restore_model.listen_to_all_addresses
+                        live_model.save()
+
+                elif tar_member == 'etc/ssh/sshd_config':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    with backup_file.extractfile(tar_member) as sshd_config:
+                        ssh_access_model = SSHAccessModel()
+
+                        re_match = re.search(pattern=r'^DenyUsers (.*)$', string=sshd_config.read().decode(), flags=re.MULTILINE)
+
+                        # If no users are denied, allow all standard users.
+                        if not re_match:
+                            for user in ssh_access_model.users:
+                                ssh_access_model.set_access(user=user, enabled=True)
+
+                        # Found denied legacy users. Translate to a list of new users to allow.
+                        else:
+                            deny_users = re_match.group(1).strip().split(' ')
+
+                            ssh_access_model.set_access(user=StandardUsers.SUPPORT.value, enabled='ddpsupport' not in deny_users)
+                            ssh_access_model.set_access(user=StandardUsers.CONSOLE.value, enabled='ddpconsole' not in deny_users)
+                            ssh_access_model.set_access(user=StandardUsers.USER.value, enabled='ddpuser' not in deny_users)
+
+                        ssh_access_model.save()
+
+                elif tar_member == 'etc/crontab':
+                    pass
+
+                elif tar_member == 'etc/hostname':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    # Just restore the file for now. Host name information will be processed downstream.
+                    backup_file.extract(member=tar_member, path='/')
+
+                elif tar_member == 'etc/hosts':
+                    # No need to import. This should be handled by the host name change.
+                    pass
+
+                elif tar_member == 'etc/localtime':
+                    # Cannot simply copy localtime in. It's a binary file, which could potentially corrupt the system
+                    # if the file format has changed since Ubuntu 12.04.
+                    pass
+
+                elif tar_member == 'etc/passwd':
+                    # Cannot simply copy the password database in. UIDs, GIDs, and even user names are all different.
+                    # The user should have set passwords on first boot.
+                    pass
+
+                elif tar_member == 'etc/shadow':
+                    # Cannot simply copy the shadow password database in. Also should not overwrite standard user
+                    # credentials. User names have changed, and the user should have set passwords on first boot.
+                    pass
+
+                elif tar_member == 'etc/wgetrc':
+                    # 9.11.0+ does not use wget.
+                    pass
+
+                elif tar_member.startswith('home/ddpuser/') and 'policyproxy.log' in tar_member:
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    target_file_path = "/{file_path}".format(file_path=tar_member.replace('ddpuser', StandardUsers.USER.value))
+                    backup_file.extract(member=tar_member, path='/tmp')
+                    fileutil.move(src="/tmp/{tar_member}".format(tar_member=tar_member), dst=target_file_path)
+                    fileutil.chown(path=target_file_path)
+
+                # CA certificates.
+                elif tar_member.startswith('opt/dell/CA/'):
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    # Make a backup of the current file, then copy in the restore file.
+                    self._overwrite_existing(backup_file=backup_file, tar_member=tar_member, time_stamp=backup_time_stamp)
+
+                elif tar_member == 'opt/dell/cfg/.firstlogin':
+                    # No need to migrate .firstlogin flag file since the user has already gone through the first boot
+                    # configuration wizard prior to being allowed to execute a restore.
+                    pass
+
+                elif tar_member == 'opt/dell/cfg/backup.cfg':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    # Extract the restore file to a temporary directory.
+                    backup_file.extract(member=tar_member, path='/tmp')
+                    restore_file_path = "/tmp/{file_path}".format(file_path=tar_member)
+
+                    live_model = BackupScheduleModel()
+                    restore_model = LegacyBackupScheduleModel(file_path=restore_file_path)
+                    restore_model.load()
+
+                    live_model.schedule = restore_model.schedule
+                    live_model.day_of_the_week = restore_model.day_of_the_week
+                    live_model.day_of_the_month = restore_model.day_of_the_month
+                    live_model.time = restore_model.time
+                    live_model.save()
+
+                elif tar_member == 'opt/dell/cfg/cert.cfg':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    # Extract the restore file to a temporary directory.
+                    backup_file.extract(member=tar_member, path='/tmp')
+                    restore_file_path = "/tmp/{file_path}".format(file_path=tar_member)
+
+                    restore_model = LegacyCertificatePropertiesModel(file_path=restore_file_path)
+                    restore_model.load()
+
+                    application_properties['certificate.common_name'] = restore_model.common_name
+                    application_properties['certificate.country'] = restore_model.country
+                    application_properties['certificate.email'] = restore_model.email
+                    application_properties['certificate.locality'] = restore_model.locality
+                    application_properties['certificate.organization'] = restore_model.organization
+                    application_properties['certificate.organizational_unit'] = restore_model.organizational_unit
+                    application_properties['certificate.state'] = restore_model.state
+
+                    application_properties.save()
+
+                elif tar_member == 'opt/dell/cfg/deburlpath.cfg':
+                    # No need to migrate Debian update server URL since this is no longer a user-configurable setting
+                    # starting with release 9.11.0.
+                    pass
+
+                elif tar_member == 'opt/dell/cfg/email.cfg':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    # Extract the restore file to a temporary directory.
+                    backup_file.extract(member=tar_member, path='/tmp')
+                    restore_file_path = "/tmp/{file_path}".format(file_path=tar_member)
+
+                    live_model = EmailNotificationModel()
+                    restore_model = LegacyEmailNotificationModel(file_path=restore_file_path)
+                    restore_model.load()
+
+                    live_model.enable_email_alerts = restore_model.enable_email_alerts
+                    live_model.smtp_server = restore_model.smtp_server
+                    live_model.smtp_port = restore_model.smtp_port
+                    live_model.smtp_user = restore_model.smtp_user
+                    live_model.smtp_password = restore_model.smtp_password
+                    live_model.send_notifications_from = restore_model.send_notifications_from
+                    live_model.send_server_status_to = restore_model.send_server_status_to
+                    live_model.send_password_changes_to = restore_model.send_password_changes_to
+                    live_model.send_software_updates_to = restore_model.send_software_updates_to
+                    live_model.enable_service_alert_reminder = restore_model.enable_service_alert_reminder
+                    live_model.service_alert_reminder_interval_minutes = restore_model.service_alert_reminder_interval_minutes
+                    live_model.summary_report_schedule = restore_model. summary_report_schedule
+                    live_model.save()
+
+                elif tar_member == 'opt/dell/cfg/ftpuser.cfg':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    # Extract the restore file to a temporary directory.
+                    backup_file.extract(member=tar_member, path='/tmp')
+                    restore_file_path = "/tmp/{file_path}".format(file_path=tar_member)
+
+                    live_model = UserModel()
+                    restore_model = LegacySFTPUserModel(file_path=restore_file_path)
+                    restore_model.load()
+
+                    for user_name, password in restore_model.credentials:
+                        try:
+                            # Existing FTP user. Just set the password.
+                            if user_name in live_model.sftp_users():
+                                live_model.set_sftp_user_password(user_name=user_name, password=password)
+                            # User doesn't exist, so create it now.
+                            else:
+                                live_model.add_sftp_user(user_name=user_name, password=password)
+                        except RuntimeError:
+                            # We don't necessarily want to halt the restore process if there was bad user data. The
+                            # event will be logged, so we'll consider that as good enough for now.
+                            pass
+
+                elif tar_member == 'opt/dell/cfg/locale.cfg':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    with backup_file.extractfile(tar_member) as locale_cfg:
+                        language = locale_cfg.read().decode()
+                        application_properties['locale'] = get_locale_from_legacy_language(language)
+                        logger.info(msg="Locale: {locale}".format(locale=application_properties['locale']))
+                        application_properties.save()
+
+                elif tar_member == 'opt/dell/cfg/logrotate.cfg':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    # Extract the restore file to a temporary directory.
+                    backup_file.extract(member=tar_member, path='/tmp')
+                    restore_file_path = "/tmp/{file_path}".format(file_path=tar_member)
+
+                    live_model = LogrotateScheduleModel()
+                    restore_model = LegacyLogrotateScheduleModel(file_path=restore_file_path)
+                    restore_model.load()
+
+                    live_model.schedule = restore_model.schedule
+                    live_model.day_of_the_week = restore_model.day_of_the_week
+                    live_model.day_of_the_month = restore_model.day_of_the_month
+                    live_model.time = restore_model.time
+                    live_model.save()
+
+                # Time zone.
+                elif tar_member == 'opt/dell/server/conf/timezone':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    original_properties = self.register_live_model(model=TimeZoneModel(backup_time_stamp=backup_time_stamp))
+                    restore_properties = self.create_restore_model(cls=TimeZoneModel, backup_file=backup_file, tar_member=tar_member)
+
+                    restore_properties.load()
+                    original_properties.time_zone = restore_properties.time_zone
+                    original_properties.save()
+
+                # Compatibility Server.
+                elif tar_member.startswith('opt/dell/server/compatibility-server/'):
+                    # The Console doesn't modify any of these properties, so bypass the copy.
+                    if tar_member == 'opt/dell/server/compatibility-server/conf/application.properties':
+                        pass
+
+                    # The Console only modifies the database password. We'll need to force a database password change at
+                    # the end of the restore process, so bypass the copy.
+                    elif tar_member.endswith('/server_config.xml'):
+                        pass
+
+                    # For all other files, make a backup of the current file, then copy in the restore file.
+                    else:
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        self._overwrite_existing(backup_file=backup_file, tar_member=tar_member, time_stamp=backup_time_stamp)
+
+                # Core Server.
+                elif tar_member.startswith('opt/dell/server/core-server/'):
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    if tar_member == 'opt/dell/server/core-server/Application.properties':
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        original_properties = self.register_live_model(model=CoreServerApplicationConfigurationModel(file_path=target_file_path))
+                        restore_properties = self.create_restore_model(cls=CoreServerApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+
+                        restore_properties.load()
+                        original_properties.atp_email_enable = restore_properties.atp_email_enable
+                        original_properties.atp_email_event_list = restore_properties.atp_email_event_list
+                        original_properties.disconnected_mode = restore_properties.disconnected_mode
+                        original_properties.save()
+
+                    # The Console only modifies the database password. We'll need to force a database password change at
+                    # the end of the restore process, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/core-server/Database.properties':
+                        pass
+
+                    elif tar_member == 'opt/dell/server/core-server/EntityDataAccessObjects.config':
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        live_model = self.register_live_model(model=CoreServerEntityDataAccessObjectsModel())
+                        restore_model = self.create_restore_model(cls=CoreServerEntityDataAccessObjectsModel, backup_file=backup_file, tar_member=tar_member)
+
+                        restore_model.load()
+                        live_model.disable_trust = restore_model.disable_trust
+                        live_model.save()
+
+                    # For all other files, make a backup of the current file, then copy in the restore file.
+                    else:
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        self._overwrite_existing(backup_file=backup_file, tar_member=tar_member, time_stamp=backup_time_stamp)
+
+                # Core Server Proxy.
+                elif tar_member.startswith('opt/dell/server/core-server-proxy/'):
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    if tar_member == 'opt/dell/server/core-server-proxy/conf/application.properties':
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        original_properties = self.register_live_model(model=CoreServerProxyApplicationConfigurationModel(file_path=target_file_path))
+                        restore_properties = self.create_restore_model(cls=CoreServerProxyApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+
+                        restore_properties.load()
+                        original_properties.keystore_alias_ssl = restore_properties.keystore_alias_ssl
+                        original_properties.save()
+
+                    # For all other files, make a backup of the current file, then copy in the restore file.
+                    else:
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        self._overwrite_existing(backup_file=backup_file, tar_member=tar_member, time_stamp=backup_time_stamp)
+
+                # Forensic Server.
+                elif tar_member.startswith('opt/dell/server/forensic-server/'):
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    if tar_member == 'opt/dell/server/forensic-server/conf/application.properties':
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        original_properties = self.register_live_model(model=ForensicServerApplicationConfigurationModel(file_path=target_file_path))
+                        restore_properties = self.create_restore_model(cls=ForensicServerApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+                        restore_properties.load()
+
+                        original_properties.keystore_alias_ssl = restore_properties.keystore_alias_ssl
+                        original_properties.save()
+
+                    # The Console only modifies the database password. We'll need to force a database password change at
+                    # the end of the restore process, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/forensic-server/conf/db.properties':
+                        pass
+
+                    # For all other files, make a backup of the current file, then copy in the restore file.
+                    else:
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        self._overwrite_existing(backup_file=backup_file, tar_member=tar_member, time_stamp=backup_time_stamp)
+
+                # Inventory Server.
+                elif tar_member.startswith('opt/dell/server/inventory-server/'):
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    if tar_member == 'opt/dell/server/inventory-server/Application.properties':
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        original_properties = self.register_live_model(model=InventoryServerApplicationConfigurationModel(file_path=target_file_path))
+                        restore_properties = self.create_restore_model(cls=InventoryServerApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+
+                        restore_properties.load()
+                        original_properties.atp_email_enable = restore_properties.atp_email_enable
+                        original_properties.atp_email_event_list = restore_properties.atp_email_event_list
+                        original_properties.smtp_host = restore_properties.smtp_host
+                        original_properties.smtp_port = restore_properties.smtp_port
+                        original_properties.smtp_username = restore_properties.smtp_username
+                        original_properties.smtp_password = restore_properties.smtp_password
+                        original_properties.disconnected_mode = restore_properties.disconnected_mode
+                        original_properties.save()
+
+                    # The Console only modifies the database password. We'll need to force a database password change at
+                    # the end of the restore process, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/inventory-server/Database.properties':
+                        pass
+
+                    # For all other files, make a backup of the current file, then copy in the restore file.
+                    else:
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        self._overwrite_existing(backup_file=backup_file, tar_member=tar_member, time_stamp=backup_time_stamp)
+
+                # Identity Server.
+                elif tar_member.startswith('opt/dell/server/local-server/'):
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    if tar_member == 'opt/dell/server/local-server/conf/application.properties':
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        original_properties = self.register_live_model(model=IdentityServerApplicationConfigurationModel(file_path=target_file_path))
+                        restore_properties = self.create_restore_model(cls=IdentityServerApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+
+                        restore_properties.load()
+                        original_properties.keystore_alias_ssl = restore_properties.keystore_alias_ssl
+                        original_properties.save()
+
+                    # The Console only modifies the database password. We'll need to force a database password change at
+                    # the end of the restore process, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/local-server/conf/db.properties':
+                        pass
+
+                    # For all other files, make a backup of the current file, then copy in the restore file.
+                    else:
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        self._overwrite_existing(backup_file=backup_file, tar_member=tar_member, time_stamp=backup_time_stamp)
+
+                # Message Broker.
+                elif tar_member.startswith('opt/dell/server/message-broker/'):
+                    # The Console doesn't modify any of these properties, so bypass the copy.
+                    if tar_member == 'opt/dell/server/message-broker/conf/application.properties':
+                        pass
+
+                    # The Console only modifies the database password. We'll need to force a database password change at
+                    # the end of the restore process, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/message-broker/conf/db.properties':
+                        pass
+
+                    # For all other files, make a backup of the current file, then copy in the restore file.
+                    else:
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        self._overwrite_existing(backup_file=backup_file, tar_member=tar_member, time_stamp=backup_time_stamp)
+
+                # Compliance Reporter.
+                elif tar_member.startswith('opt/dell/server/reporter/'):
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    # The Console doesn't modify any of these properties, so bypass the copy.
+                    if tar_member == 'opt/dell/server/reporter/conf/application.properties':
+                        pass
+
+                    # The Console only modifies the database password. We'll need to force a database password change at
+                    # the end of the restore process, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/reporter/conf/db.properties':
+                        pass
+
+                    elif tar_member == 'opt/dell/server/reporter/conf/eserver.properties':
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        original_properties = self.register_live_model(model=ComplianceReporterApplicationConfigurationModel(file_path=target_file_path))
+                        original_properties.load()
+                        restore_properties = self.create_restore_model(cls=ComplianceReporterApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+                        restore_properties.load()
+
+                        original_properties.eserver_keystore_alias = restore_properties.eserver_keystore_alias
+                        original_properties.save()
+
+                    # The Console doesn't modify any of these properties, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/reporter/conf/keyStore.properties':
+                        pass
+
+                    elif tar_member == 'opt/dell/server/reporter/reporterBackup.zip':
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        with backup_file.extractfile(member=tar_member) as reporter_backup_zip:
+                            with ZipFile(reporter_backup_zip) as zip_file:
+                                # Only perform a restore if the backup ZIP contains the main database file.
+                                if 'cmgreports.data.db' in zip_file.namelist():
+                                        # Archive existing database files.
+                                        for reporter_database_file in glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/cmgreports.*.db'):
+                                            live_model = self.register_live_model(model=FileModel(file_path=reporter_database_file, backup_time_stamp=backup_time_stamp))
+                                            live_model.create_backup()
+                                            os.remove(path=reporter_database_file)
+                                        for reporter_database_file in glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/template/cmgreports.*.db'):
+                                            live_model = self.register_live_model(model=FileModel(file_path=reporter_database_file, backup_time_stamp=backup_time_stamp))
+                                            live_model.create_backup()
+                                            os.remove(path=reporter_database_file)
+
+                                        # Copy in all files required by the database.
+                                        zip_file.extractall(path='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/')
+
+                                        # Copy in the run-time backup file.
+                                        zip_file.extract(
+                                            member='cmgreports.data.db',
+                                            path='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/template/'
+                                        )
+
+                                        # Configure file ownership.
+                                        for file_path in \
+                                                glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/*.db') + \
+                                                glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/template/*.db'):
+                                            fileutil.chown(path=file_path)
+
+                                        # Configure file permissions.
+                                        for database_file_path in \
+                                                glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/cmgreports.*.db') + \
+                                                glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/template/cmgreports.*.db'):
+                                            # Without the execute bit, Compliance Reporter will report that the database
+                                            # is in read-only mode.
+                                            os.chmod(path=database_file_path, mode=0o755)
+
+                    elif tar_member == 'opt/dell/server/reporter/webapp/WEB-INF/reports/db/template/cmgreports.data.db':
+                        # Ignore unused database backup file incorrectly included in legacy VE backup bundles.
+                        pass
+
+                    # For all other files, make a backup of the current file, then copy in the restore file.
+                    else:
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        self._overwrite_existing(backup_file=backup_file, tar_member=tar_member, time_stamp=backup_time_stamp)
+
+                # Security Server.
+                elif tar_member.startswith('opt/dell/server/security-server/'):
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    if tar_member == 'opt/dell/server/security-server/conf/application.properties':
+                        try:
+                            self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                            original_properties = self.register_live_model(model=SecurityServerApplicationConfigurationModel(file_path=target_file_path))
+                            original_properties.load()
+                            restore_properties = self.create_restore_model(cls=SecurityServerApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+                            restore_properties.load()
+
+                            original_properties.atp_tenant_name = restore_properties.atp_tenant_name
+                            original_properties.disconnected_mode = restore_properties.disconnected_mode
+                            original_properties.javamail_smtp_from = restore_properties.javamail_smtp_from
+                            original_properties.javamail_smtp_host = restore_properties.javamail_smtp_host
+                            original_properties.javamail_smtp_password = restore_properties.javamail_smtp_password
+                            original_properties.javamail_smtp_port = restore_properties.javamail_smtp_port
+                            original_properties.javamail_smtp_username = restore_properties.javamail_smtp_username
+                            original_properties.keystore_alias_ssl = restore_properties.keystore_alias_ssl
+                            original_properties.publicdns_server_host = restore_properties.publicdns_server_host
+                            original_properties.reporter_server_url = ''
+                            original_properties.server_host = restore_properties.server_host
+                            original_properties.save()
+
+                            # Consider Security Server to be the authority on whether or not we running in disconnected
+                            # mode. Save the setting to the Console configuration file.
+                            application_properties['disconnected.mode'] = str(restore_properties.disconnected_mode).lower()
+                            application_properties.save()
+                        except Exception as e:
+                            logger.error(str(e))
+
+                    # The Console only modifies the database password. We'll need to force a database password change at
+                    # the end of the restore process, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/security-server/conf/db.properties':
+                        pass
+
+                    # The Console doesn't modify any of these properties, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/security-server/conf/device-access.xml':
+                        pass
+
+                    # The Console doesn't modify any of these properties, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/security-server/conf/registration-access.xml':
+                        pass
+
+                    # The Console doesn't modify any of these properties, so bypass the copy.
+                    elif tar_member == 'opt/dell/server/security-server/conf/webdefault.xml':
+                        pass
+
+                    # For all other files, make a backup of the current file, then copy in the restore file.
+                    else:
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        self._overwrite_existing(backup_file=backup_file, tar_member=tar_member, time_stamp=backup_time_stamp)
+
+                elif tar_member == 'opt/dell/version.xml':
+                    # Don't allow a restore to overwrite our software version.
+                    pass
+
+                # Restore main database.
+                elif tar_member.startswith('tmp/ddp_9_10_1.bak.'):
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    database_name = 'ddp'
+                    target_file_path = "/tmp/{file_path}".format(file_path=tar_member)
+                    backup_file.extract(member=tar_member, path='/tmp')
+
+                    database_backup_model = self.register_live_model(model=PostgreSQLBackupModel(database_name=database_name, file_path=target_file_path))
+                    # Generate a backup of the current database before attempting the restore.
+                    database_backup_model.load()
+                    # Restore from the given backup file.
+                    database_backup_model.save()
+
+                    exit_code, stdout, stderr = Shell.run(
+                        args=[
+                            '/opt/dell/console/pydatabase.py',
+                            '--update', database_name, self.LEGACY_UPGRADE_PATH_VERSION
+                        ]
+                    )
+                    if exit_code:
+                        logger.error(msg="Failed to drop database '{database_name}':\n{stderr}".format(database_name=database_name, stderr=stderr))
+                        # stderr from pydatabase would already be localized.
+                        raise RuntimeError(stderr)
+
+                    self.append_message(message=stdout)
+
+                # Restore audit database.
+                elif tar_member.startswith('tmp/ddp_audit_9_10_1.bak.'):
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    database_name = 'ddp_audit'
+                    target_file_path = "/tmp/{file_path}".format(file_path=tar_member)
+                    backup_file.extract(member=tar_member, path='/tmp')
+
+                    database_backup_model = self.register_live_model(model=PostgreSQLBackupModel(database_name=database_name, file_path=target_file_path))
+                    # Generate a backup of the current database before attempting the restore.
+                    database_backup_model.load()
+                    # Restore from the given backup file.
+                    database_backup_model.save()
+
+                    exit_code, stdout, stderr = Shell.run(
+                        args=[
+                            '/opt/dell/console/pydatabase.py',
+                            '--update', database_name, self.LEGACY_UPGRADE_PATH_VERSION
+                        ]
+                    )
+                    if exit_code:
+                        logger.error(msg="Failed to drop database '{database_name}':\n{stderr}".format(database_name=database_name, stderr=stderr))
+                        # stderr from pydatabase would already be localized.
+                        raise RuntimeError(stderr)
+
+                    self.append_message(message=stdout)
+
+                # Firewall rules.
+                elif tar_member == 'tmp/misc.conf':
+                    # NOTE: This logic is oddly placed because DMZ configuration is managed in two different places;
+                    #       Security Server configuration and firewall rules.
+                    with backup_file.extractfile(tar_member) as misc_conf:
+                        ufw_line = misc_conf.read().decode()
+
+                        # TODO: Define this in a centralized location.
+                        application = 'Message Broker STOMP'
+
+                        if re.search(pattern=r'ufw allow 61613', string=ufw_line):
+                            UFW.allow(application=application)
+                        # If explicitly denying access, or even if we don't find a setting, block the traffic.
+                        else:
+                            UFW.deny(application=application)
+
+                # Ignore files.
+                elif tar_member.startswith('usr/'):
+                    # Contained Nagios custom plugins and event handlers that were never modified, so they should have
+                    # never been backed up. Doing so could result in broken Nagios environments after a restore.
+                    pass
+
+                # NOTE: All restore operations need to be explicit and intentional.
+                #       If there's an unexpected file in the backup bundle, either we missed the restore logic here, or
+                #       it was injected into the bundle in an unsupported manner.
+                #       Log the warning, but don't raise an exception, in order to maintain a seamless user experience.
+                else:
+                    pass
+                    # logger.warning(
+                    #     msg="Unexpected file found in backup bundle: {problem_file_entry}".format(
+                    #         problem_file_entry=tar_member
+                    #     ))
+
+        # At this point, the final version of /etc/hostname should be present on disk. Now we can use it to set host
+        # names in application configuration files.
+        with HostModel():
+            # Load the current /etc/hostname.
+            # Push host name changes to all applicable configuration files.
+            pass
+
+        # Cover scenarios where the backup bundle was created from a prior release, which would restore the database
+        # schema and data from that release and fail to re-create the most current database schema.
+        version_history_model = VersionHistoryModel()
+        version_history_model.load()
+        since_version = list(version_history_model.version_history.keys())[0] if len(version_history_model.version_history) > 0 else '0.0.0'
+        for database_name in ['ddp', 'ddp_audit']:
+            exit_code, stdout, stderr = Shell.run(args=['/opt/dell/console/pydatabase.py', '--update', database_name, since_version])
+            if exit_code:
+                logger.error(msg="Failed to update '{database_name}' schema:n{stderr}".format(database_name=database_name, stderr=stderr))
+                raise RuntimeError(_("Failed to update '{database_name}' schema:").format(database_name=database_name))
+            logger.info(msg=stdout)
+            print(_("Database updated: {database_name}").format(database_name=database_name))
+
+        # Clear out the Policy Proxy queue to force a re-activation.
+        logger.info(msg='Clearing Policy Proxy queue to force re-activation...')
+        shutil.rmtree(
+            path="/home/{user_name}/.wine/drive_c/users/Public/Application\ Data/Dell/GateKeeper/Queue/".format(user_name=StandardUsers.USER.value),
+            ignore_errors=True
+        )
+
+        # Re-import any certificates that were dropped in during software installation that would have been lost when
+        # overwriting the key store file during restore.
+        JavaKeyStore.import_certificates()
+
+        # Disable Compliance Reporter link until it's completely retired.
+        with SecurityServerApplicationConfigurationModel(file_path=SERVICES[Services.SECURITY_SERVER]['configuration']['application']) as security_server_application_properties:
+            security_server_application_properties.load()
+            security_server_application_properties.reporter_server_url = ''
+            security_server_application_properties.save()
+
+
+class RestoreModel(RestoreModelBase):
+    DEFAULT_BACKUP_FOLDER = FILE_TRANSFER['backup']
+    DEFAULT_MATCH_PATTERN = r'^{application_name}_(.*)_backup_.*\.tgz$'.format(application_name=APP_NAME)
+
+    def __init__(self, backup_file_path, backup_manifest=BackupModel.BACKUP_MANIFEST, on_append_message=None):
+        """Restore model used to import settings from a backup bundle.
+
+        :param backup_manifest: Dictionary to represent a categorized manifest of files to be extracted from the
+                                backup bundle.
+        :type backup_manifest: dict(str, list(str))
+        :param backup_file_path: Absolute path to the backup bundle to restore.
+        :type backup_file_path: str
+        """
+
+        super().__init__(backup_file_path=backup_file_path, on_append_message=on_append_message)
+
+        # Attempt to restore an unsupported file.
+        if not re.match(pattern=self.DEFAULT_MATCH_PATTERN, string=os.path.basename(self.backup_file_path)):
+            raise RuntimeError(_('Attempted to restore from an unsupported backup file. A restore can only be done from a 9.10.1+ backup file.'))
+
+        self.backup_manifest = backup_manifest
+
+        # Ignored files that are included in the backup bundle for informational purposes only, and would
+        # corrupt the system if allowed to be copied over existing files.
+        self._ignore_files = [
+            'opt/dell/server/compatibility-server/conf/application.properties',
+            'opt/dell/server/compatibility-server/conf/server_config.xml',
+            'opt/dell/server/core-server/Database.properties',
+            'opt/dell/server/forensic-server/conf/db.properties',
+            'opt/dell/server/inventory-server/Database.properties',
+            'opt/dell/server/local-server/conf/db.properties',
+            'opt/dell/server/message-broker/conf/application.properties',
+            'opt/dell/server/message-broker/conf/db.properties',
+            'opt/dell/server/reporter/conf/application.properties',
+            'opt/dell/server/reporter/conf/db.properties',
+            'opt/dell/server/security-server/conf/db.properties',
+            'opt/dell/server/security-server/conf/webdefault.xml',
+            'opt/dell/version.xml'
+        ]
+
+    @staticmethod
+    def backup_files():
+        files = [
+            os.path.join(dirpath, file)
+            for dirpath, dirnames, filenames in os.walk(top=RestoreModel.DEFAULT_BACKUP_FOLDER)
+            for file in filenames if re.match(pattern=RestoreModel.DEFAULT_MATCH_PATTERN, string=file)
+        ]
+
+        current_version = LooseVersion(VERSION)
+        display_files = []
+
+        # Protect against attempts to restore from a future version.
+        for file in files:
+            match = re.match(pattern=RestoreModel.DEFAULT_MATCH_PATTERN, string=os.path.basename(file))
+            if match:
+                backup_version = LooseVersion(match.group(1))
+                if backup_version <= current_version:
+                    display_files.append(file)
+
+        return sorted(
+            display_files,
+            key=lambda file:LooseVersion(re.match(pattern=RestoreModel.DEFAULT_MATCH_PATTERN, string=os.path.basename(file)).group(1)),
+            reverse=True
+        )
+
+    def restore(self):
+        self.append_message(message=_("Starting restore from backup file: {backup_file}").format(backup_file=self.backup_file_path))
+
+        backup_time_stamp = DateTime.time_stamp_string()
+        acl_directory_present = False
+
+        # In the event of a failure, an automatic restore of application.properties will be done. If the backup does
+        # not exist, then there will be a 'file not found' error.
+        self.application_properties_backup_file_path = fileutil.backup(src=APPLICATION_PROPERTIES_PATH, time_stamp=backup_time_stamp)
+
+        with tarfile.open(name=self.backup_file_path) as backup_file:
+            backup_version = ''
+            with backup_file.extractfile('opt/dell/version.xml') as version_xml:
+                tree = ElementTree.parse(version_xml)
+                backup_version = tree.findtext(path='./version')
+
+            # Custom kernel parameters need to be dropped onto the file system before the NetworkModel starts to
+            # operate, because it determines IPv6 support internally by checking kernel parameters.
+            if 'etc/sysctl.d/999-dsmsv.conf' in backup_file.getnames():
+                self.append_message(message="  {tar_member}".format(tar_member='etc/sysctl.d/999-dsmsv.conf'))
+                backup_file.extract(member='etc/sysctl.d/999-dsmsv.conf', path='/')
+
+            for tar_member in backup_file.getnames():
+                if tar_member in self._ignore_files:
+                    continue
+
+                # Special case for 9.11.0-original deployments that may have generated backup files of the apt
+                # configuration overrides. Any file in this directory with an extension will fail apt commands.
+                if tar_member.startswith('etc/apt/apt.conf.d/99dsmsv.'):
+                    continue
+
+                # Login banner.
+                if tar_member.startswith('etc/issue'):
+                    # Starting with 10.0.0, NetworkModel will regenerate the login banner.
+                    continue
+
+                # Nagios.
+                elif tar_member == 'etc/nagios3/conf.d/dds.cfg':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    live_model = self.register_live_model(model=NagiosDdsCfgFileModel())
+                    restore_model = self.create_restore_model(cls=NagiosDdsCfgFileModel, backup_file=backup_file, tar_member=tar_member)
+
+                    live_model.load()
+                    restore_model.load()
+
+                    live_model.notifications_enabled = restore_model.notifications_enabled
+                    live_model.notification_interval = restore_model.notification_interval
+                    live_model.emails = restore_model.emails
+
+                    live_model.save()
+                    Systemd.restart_unit(unit_name='nagios3.service')
+
+                # Network configuration.
+                elif tar_member == 'etc/network/interfaces':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    live_model = self.register_live_model(model=NetworkModel(backup_time_stamp=backup_time_stamp))
+                    restore_model = self.create_restore_model(cls=NetworkModel, backup_file=backup_file, tar_member=tar_member)
+
+                    live_model.load()
+                    restore_model.load()
+
+                    live_model.enable_ipv4_support = restore_model.enable_ipv4_support
+                    live_model.ipv4_use_dhcp = restore_model.ipv4_use_dhcp
+                    live_model.ipv4_static_ip_model = restore_model.ipv4_static_ip_model
+                    live_model.enable_ipv6_support = restore_model.enable_ipv6_support
+                    live_model.ipv6_use_dhcp = restore_model.ipv6_use_dhcp
+                    live_model.ipv6_static_ip_model = restore_model.ipv6_static_ip_model
+
+                    live_model.save()
+                    configure_java_network_stack_preferences(prefer_ipv6=restore_model.enable_ipv6_support)
+
+                elif tar_member == 'etc/sysctl.d/999-dsmsv.conf':
+                    # Already done before the for loop.
+                    continue
+
+                # Time zone.
+                elif tar_member == 'etc/timezone':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    live_model = self.register_live_model(model=TimeZoneModel(backup_time_stamp=backup_time_stamp))
+                    restore_model = self.create_restore_model(cls=TimeZoneModel, backup_file=backup_file, tar_member=tar_member)
+
+                    restore_model.load()
+
+                    live_model.time_zone = restore_model.time_zone
+                    live_model.save()
+
+                # Administration Console.
+                elif tar_member == APPLICATION_PROPERTIES_PATH[1:]:
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    # Overwrite the existing configuration file.
+                    backup_file.extract(member=tar_member, path='/')
+
+                    # Reload application.properties in order to import configuration settings into various
+                    # parts of the system not modeled by the other configuration files.
+                    application_properties = Properties(file_name=APPLICATION_PROPERTIES_PATH)
+                    configure_application_settings(properties=application_properties)
+
+                    email_notification_model = EmailNotificationModel()
+                    email_notification_model.load()
+                    email_notification_model.save()
+
+                    backup_schedule_model = BackupScheduleModel()
+                    backup_schedule_model.load()
+                    backup_schedule_model.save()
+
+                    logrotate_schedule_model = LogrotateScheduleModel()
+                    logrotate_schedule_model.load()
+                    logrotate_schedule_model.save()
+
+                # NOTE: Hard-coded to detect 'ddp' database, which isn't great, but it's easier than future-proofing by
+                #       creating a generalized regular expression to detect any database name.
+                elif re.match(pattern=r"tmp/{application_name}_.+_ddp_backup_.*".format(application_name=APP_NAME), string=tar_member):
+                    database_name = 'ddp'
+                    target_file_path = "/tmp/{file_path}".format(file_path=tar_member)
+                    backup_file.extract(member=tar_member, path='/tmp')
+
+                    database_backup_model = self.register_live_model(model=PostgreSQLBackupModel(database_name=database_name, file_path=target_file_path))
+                    # Generate a backup of the current database before attempting the restore.
+                    database_backup_model.load()
+                    # Restore from the given backup file.
+                    database_backup_model.save()
+
+                    exit_code, stdout, stderr = Shell.run(
+                        args=[
+                            '/opt/dell/console/pydatabase.py',
+                            '--update', database_name, backup_version
+                        ]
+                    )
+                    if exit_code:
+                        logger.error(msg="Failed to drop database '{database_name}':\n{stderr}".format(database_name=database_name, stderr=stderr))
+                        # stderr from pydatabase would already be localized.
+                        raise RuntimeError(stderr)
+
+                    self.append_message(message=stdout)
+
+                # NOTE: Hard-coded to detect 'ddp' database, which isn't great, but it's easier than future-proofing by
+                #       creating a generalized regular expression to detect any database name.
+                elif re.match(pattern=r"tmp/{application_name}_.+_ddp_audit_backup_.*".format(application_name=APP_NAME), string=tar_member):
+                    database_name = 'ddp_audit'
+                    target_file_path = "/tmp/{file_path}".format(file_path=tar_member)
+                    backup_file.extract(member=tar_member, path='/tmp')
+
+                    database_backup_model = self.register_live_model(model=PostgreSQLBackupModel(database_name=database_name, file_path=target_file_path))
+                    # Generate a backup of the current database before attempting the restore.
+                    database_backup_model.load()
+                    # Restore from the given backup file.
+                    database_backup_model.save()
+
+                    exit_code, stdout, stderr = Shell.run(
+                        args=[
+                            '/opt/dell/console/pydatabase.py',
+                            '--update', database_name, backup_version
+                        ]
+                    )
+                    if exit_code:
+                        logger.error(msg="Failed to drop database '{database_name}':\n{stderr}".format(database_name=database_name, stderr=stderr))
+                        # stderr from pydatabase would already be localized.
+                        raise RuntimeError(stderr)
+
+                    self.append_message(message=stdout)
+
+                # ACL Service should not restore
+                elif tar_member.startswith('opt/dell/server/acl-service'):
+                    acl_directory_present = True
+                    continue
+
+                # Compliance Reporter.
+                elif tar_member == 'opt/dell/server/reporter/reporterBackup.zip':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    with backup_file.extractfile(member=tar_member) as reporter_backup_zip:
+                        with ZipFile(reporter_backup_zip) as zip_file:
+                            # Only perform a restore if the backup ZIP contains the main database file.
+                            if 'cmgreports.data.db' in zip_file.namelist():
+                                # Archive existing database files.
+                                for reporter_database_file in glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/cmgreports.*.db'):
+                                    live_model = self.register_live_model(model=FileModel(file_path=reporter_database_file, backup_time_stamp=backup_time_stamp))
+                                    live_model.create_backup()
+                                    os.remove(path=reporter_database_file)
+                                for reporter_database_file in glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/template/cmgreports.*.db'):
+                                    live_model = self.register_live_model(model=FileModel(file_path=reporter_database_file, backup_time_stamp=backup_time_stamp))
+                                    live_model.create_backup()
+                                    os.remove(path=reporter_database_file)
+
+                                # Copy in all files required by the database.
+                                zip_file.extractall(path='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/')
+
+                                # Copy in the run-time backup file.
+                                zip_file.extract(
+                                    member='cmgreports.data.db',
+                                    path='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/template/'
+                                )
+
+                                # Configure file ownership.
+                                for file_path in \
+                                        glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/*.db') + \
+                                        glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/template/*.db'):
+                                    fileutil.chown(path=file_path)
+
+                                # Configure file permissions.
+                                for database_file_path in \
+                                        glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/cmgreports.*.db') + \
+                                        glob.glob(pathname='/opt/dell/server/reporter/webapp/WEB-INF/reports/db/template/cmgreports.*.db'):
+                                    # Without the execute bit, Compliance Reporter will report that the database
+                                    # is in read-only mode.
+                                    os.chmod(path=database_file_path, mode=0o755)
+
+                # Core Server.
+                elif tar_member.startswith('opt/dell/server/core-server/'):
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    # NOTE: Special processing added in 10.2.9 to account for added 'acl.server.host',
+                    #       'acl.server.port', 'acl.server.scheme', 'acl.tenant' properties.
+                    if tar_member == 'opt/dell/server/core-server/Application.properties':
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        original_properties = self.register_live_model(model=CoreServerApplicationConfigurationModel(file_path=target_file_path))
+                        restore_properties = self.create_restore_model(cls=CoreServerApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+
+                        restore_properties.load()
+                        original_properties.atp_email_enable = restore_properties.atp_email_enable
+                        original_properties.atp_email_event_list = restore_properties.atp_email_event_list
+                        original_properties.disconnected_mode = restore_properties.disconnected_mode
+                        original_properties.save()
+
+                    elif tar_member == 'opt/dell/server/core-server/EntityDataAccessObjects.config':
+                        self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                        live_model = self.register_live_model(model=CoreServerEntityDataAccessObjectsModel())
+                        restore_model = self.create_restore_model(cls=CoreServerEntityDataAccessObjectsModel, backup_file=backup_file, tar_member=tar_member)
+
+                        restore_model.load()
+                        live_model.disable_trust = restore_model.disable_trust
+                        live_model.save()
+
+                # Forensic Server.
+                # NOTE: Special processing added in 10.2.7 to account for 'keystore.alias.signing' deprecation.
+                elif tar_member == 'opt/dell/server/forensic-server/conf/application.properties':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    live_model = self.register_live_model(model=ForensicServerApplicationConfigurationModel(file_path=target_file_path))
+                    restore_model = self.create_restore_model(cls=ForensicServerApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+
+                    restore_model.load()
+                    live_model.keystore_alias_ssl = restore_model.keystore_alias_ssl
+                    live_model.save()
+
+                # Identity Server.
+                # NOTE: Special processing added in 10.2.7 to account for 'keystore.alias.signing' deprecation.
+                elif tar_member == 'opt/dell/server/local-server/conf/application.properties':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    original_properties = self.register_live_model(model=IdentityServerApplicationConfigurationModel(file_path=target_file_path))
+                    restore_properties = self.create_restore_model(cls=IdentityServerApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+
+                    restore_properties.load()
+                    original_properties.keystore_alias_ssl = restore_properties.keystore_alias_ssl
+                    original_properties.save()
+
+                # Inventory Server.
+                # NOTE: Special processing added in 10.2.9 to account for added 'acl.server.host', 'acl.server.port',
+                #       'acl.server.scheme', 'acl.tenant' properties.
+                elif tar_member == 'opt/dell/server/inventory-server/Application.properties':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    original_properties = self.register_live_model(model=InventoryServerApplicationConfigurationModel(file_path=target_file_path))
+                    restore_properties = self.create_restore_model(cls=InventoryServerApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+
+                    restore_properties.load()
+                    original_properties.atp_email_enable = restore_properties.atp_email_enable
+                    original_properties.atp_email_event_list = restore_properties.atp_email_event_list
+                    original_properties.smtp_host = restore_properties.smtp_host
+                    original_properties.smtp_port = restore_properties.smtp_port
+                    original_properties.smtp_username = restore_properties.smtp_username
+                    original_properties.smtp_password = restore_properties.smtp_password
+                    original_properties.disconnected_mode = restore_properties.disconnected_mode
+                    original_properties.save()
+
+                # Security Server.
+                # NOTE: Special processing added in 10.2.7 to account for 'keystore.alias.signing' deprecation.
+                elif tar_member == 'opt/dell/server/security-server/conf/application.properties':
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    target_file_path = "/{file_path}".format(file_path=tar_member)
+
+                    original_properties = self.register_live_model(model=SecurityServerApplicationConfigurationModel(file_path=target_file_path))
+                    restore_properties = self.create_restore_model(cls=SecurityServerApplicationConfigurationModel, backup_file=backup_file, tar_member=tar_member)
+
+                    restore_properties.load()
+                    original_properties.atp_tenant_name = restore_properties.atp_tenant_name
+                    original_properties.disconnected_mode = restore_properties.disconnected_mode
+                    original_properties.javamail_smtp_from = restore_properties.javamail_smtp_from
+                    original_properties.javamail_smtp_host = restore_properties.javamail_smtp_host
+                    original_properties.javamail_smtp_password = restore_properties.javamail_smtp_password
+                    original_properties.javamail_smtp_port = restore_properties.javamail_smtp_port
+                    original_properties.javamail_smtp_username = restore_properties.javamail_smtp_username
+                    original_properties.keystore_alias_ssl = restore_properties.keystore_alias_ssl
+                    original_properties.publicdns_server_host = restore_properties.publicdns_server_host
+                    original_properties.reporter_server_url = ''
+                    original_properties.server_host = restore_properties.server_host
+                    original_properties.save()
+
+                    # Consider Security Server to be the authority on whether or not we running in disconnected
+                    # mode. Save the setting to the Console configuration file.
+                    application_properties = Properties(file_name=APPLICATION_PROPERTIES_PATH)
+                    application_properties['disconnected.mode'] = str(restore_properties.disconnected_mode).lower()
+                    application_properties.save()
+                    configure_application_settings(properties=application_properties)
+
+                # PostgreSQL.
+                elif tar_member.startswith('etc/postgresql/9.5/') and 9.5 < postgresql_version():
+                    if re.match(pattern=r'etc/postgresql/.*/main/pg_hba.conf', string=tar_member):
+                        live_model = self.register_live_model(model=PostgreSQLHostBasedAuthenticationModel())
+                        restore_model = self.create_restore_model(
+                            cls=PostgreSQLHostBasedAuthenticationModel,
+                            backup_file=backup_file, tar_member=tar_member
+                        )
+
+                        restore_model.load()
+                        live_model.ipv4_remote_access_enabled = restore_model.ipv4_remote_access_enabled
+                        live_model.ipv6_remote_access_enabled = restore_model.ipv6_remote_access_enabled
+                        live_model.save()
+
+                    elif re.match(pattern=r'etc/postgresql/.*/main/postgresql.conf', string=tar_member):
+                        live_model = self.register_live_model(model=PostgreSQLConfigurationModel())
+                        restore_model = self.create_restore_model(
+                            cls=PostgreSQLConfigurationModel,
+                            backup_file=backup_file, tar_member=tar_member
+                        )
+
+                        restore_model.load()
+                        live_model.listen_to_all_addresses = restore_model.listen_to_all_addresses
+                        live_model.save()
+
+                # All other files.
+                else:
+                    self.append_message(message="  {tar_member}".format(tar_member=tar_member))
+
+                    target_file_path = "/{tar_member}".format(tar_member=tar_member)
+
+                    if os.path.isfile(path=target_file_path):
+                        # Don't timestamp backup files, which already have timestamps.
+                        if not DateTime.has_time_stamp_extension(file_path=target_file_path):
+                            # Make a backup of the existing file before we try to do anything.
+                            self.register_live_model(model=FileModel(file_path=target_file_path, backup_time_stamp=backup_time_stamp))
+
+                    # Drop the file directly onto the file system.
+                    backup_file.extract(member=tar_member, path='/')
+
+        # At this point, the final version of /etc/hostname should be present on disk. Now we can use it to set host
+        # names in application configuration files.
+        with HostModel():
+            # Load the current /etc/hostname.
+            # Push host name changes to all applicable configuration files.
+            pass
+
+        # Cover scenarios where the backup bundle was created from a prior release, which would restore the database
+        # schema and data from that release and fail to re-create the most current database schema.
+        version_history_model = VersionHistoryModel()
+        version_history_model.load()
+        since_version = list(version_history_model.version_history.keys())[0] if len(version_history_model.version_history) > 0 else '0.0.0'
+        for database_name in ['ddp', 'ddp_audit']:
+            exit_code, stdout, stderr = Shell.run(args=['/opt/dell/console/pydatabase.py', '--update', database_name, since_version])
+            if exit_code:
+                logger.error(msg="Failed to update '{database_name}' schema:n{stderr}".format(database_name=database_name, stderr=stderr))
+                raise RuntimeError(_("Failed to update '{database_name}' schema:").format(database_name=database_name))
+            logger.info(msg=stdout)
+            print(_("Database updated: {database_name}").format(database_name=database_name))
+
+        # Clear out the Policy Proxy queue to force a re-activation.
+        logger.info(msg='Clearing Policy Proxy queue to force re-activation...')
+        shutil.rmtree(
+            path="/home/{user_name}/.wine/drive_c/users/Public/Application\ Data/Dell/GateKeeper/Queue/".format(user_name=StandardUsers.USER.value),
+            ignore_errors=True
+        )
+
+        # Delete ACL Firewall rule
+        if acl_directory_present:
+            logger.info(msg='Deleting ACL Service firewall rule...')
+            exit_code, stdout, stderr = Shell.run(
+                args=[
+                    'ufw',
+                    'delete',
+                    'deny',
+                    'Dell ACL Service'
+                ]
+            )
+            logger.info(msg=stdout)
+            if exit_code:
+                logger.error(msg="Failed to delete ACL Service firewall rule.")
+
+        # Re-import any certificates that were dropped in during software installation that would have been lost when
+        # overwriting the key store file during restore.
+        JavaKeyStore.import_certificates()
+
+        # Disable Compliance Reporter link until it's completely retired.
+        with SecurityServerApplicationConfigurationModel(file_path=SERVICES[Services.SECURITY_SERVER]['configuration']['application']) as security_server_application_properties:
+            security_server_application_properties.load()
+            security_server_application_properties.reporter_server_url = ''
+            security_server_application_properties.save()
+
+
+class RestoreWarningForm(InputForm):
+    def __init__(self, controller):
+        super().__init__(controller=controller, name=_('Restore'))
+
+        self.add(
+            Text,
+            text=_('\nEnsure the instance that was used to create this backup is shut down before proceeding with Restore. By selecting YES you acknowledge that you have shut down the instance used to create the backup and you will no longer use or restart the previous server.\n\nAre you sure you want to continue?\n'),
+            align=Align.CENTER,
+            attr_map=Palette.ERROR
+        )
+        self.add(Space)
+
+        self._action_buttons = self.add(
+            ActionButtons,
+            cancel_label=_('No'),
+            ok_label=_('Yes'),
+            on_cancel=self.on_cancel,
+            on_ok=self.on_ok
+        )
+
+    def on_ok(self, button=None):
+        self._controller.next(id=RestoreController.FORM_ID)
+
+    def keypress(self, size, key):
+        if key == 'esc':
+            self.on_cancel()
+        elif key == 'tab':
+            if self._body_list_box.focus == self._action_buttons.row:
+                if self._body_list_box.focus.focus == self._action_buttons.cancel_decorated:
+                    return super().keypress(size=size, key='right')
+                else:
+                    return super().keypress(size=size, key='left')
+            else:
+                return super().keypress(size=size, key=key)
+        else:
+            return super().keypress(size=size, key=key)
+
+
+class RestoreWarningController(Controller):
+    FORM_ID = 'RESTORE_WARNING'
+
+    def __init__(self, application):
+        super().__init__(application=application)
+
+        if self._application is not None:
+            self._view = self._application.register(id=self.FORM_ID, view=RestoreWarningForm(controller=self))
+
+
+class RestoreProgressForm(ProgressMessageForm):
+    def __init__(self, controller):
+        super().__init__(controller=controller, name=_('Restore'))
+
+        self.allow_exit = True
+
+        self.default_footer_text = _('Use arrow keys or Pg-Up/Down to move in text.')
+
+    def notify_message(self, message):
+        self.open_confirmation_dialog(
+            title=self._name,
+            message=message,
+            on_cancel=self.on_close_confirmation_dialog,
+            on_ok=self.on_quit,
+            cancel_label=_('Back'),
+            ok_label=_('Quit')
+        )
+
+    def notify_database_password_change(self):
+        self.open_confirmation_dialog(
+            title=_('Restore Complete'),
+            message=_('You need to change the database password.\nThis is necessary as otherwise some of the applications will not start up.'),
+            on_cancel=None,
+            on_ok=self.on_ok,
+            ok_label=_('OK')
+        )
+
+    # noinspection PyUnusedLocal
+    def on_ok(self, button=None):
+        self._controller.next(id=DatabaseAccessRestoreController.FORM_ID)
+
+
+class RestoreProgressController(Controller):
+    FORM_ID = 'RESTORE_PROGRESS'
+
+    def __init__(self, application):
+        super().__init__(application=application)
+
+        self._model = None
+
+        self._view = self._application.register(id=self.FORM_ID, view=RestoreProgressForm(controller=self))
+
+    @property
+    def model(self):
+        return self._model
+
+    @model.setter
+    def model(self, value):
+        self._model = value
+        self._model.on_append_message = self.append_message
+
+    def save(self):
+        if self._model is not None:
+            self._model.save()
+            self._view.notify_database_password_change()
+
+
+class RestoreForm(FileSelectionForm):
+    def __init__(self, controller):
+        super().__init__(controller=controller, name=_('Restore'), caption=_('Select a backup file to be restored'))
+
+    def on_file_selected(self, button, user_data):
+        self.selected_file = str(user_data[0]).strip()
+
+        if self._controller.is_backup_file(file_path=self.selected_file) or self._controller.is_legacy_backup_file(file_path=self.selected_file):
+            self.on_confirm_restore()
+        else:
+            # We really shouldn't be able to get here, but this edge case still needs to be covered to protect from
+            # regression issues. DO NOT REMOVE.
+            raise RuntimeError(_('Attempted to restore from an unsupported backup file. A restore can only be done from a 9.10.1+ backup file.'))
+
+    def on_confirm_restore(self):
+        self.open_confirmation_dialog(
+            title=_('Confirm'),
+            message=_("Restoring from a backup will require stopping {product_name} services, as well as a database password change.\n\nDo you wish to continue?").format(product_name=FULL_NAME),
+            on_cancel=self.on_close_confirmation_dialog,
+            on_ok=self.on_confirmed
+        )
+
+    # noinspection PyUnusedLocal
+    def on_confirmed(self, button=None):
+        self.on_close_confirmation_dialog()
+        self._controller.save()
+
+
+class RestoreController(Controller):
+    FORM_ID = 'RESTORE'
+
+    def __init__(self, application):
+        super().__init__(application=application)
+
+        self._view = self._application.register(id=self.FORM_ID, view=RestoreForm(controller=self))
+
+        self._restore_progress_controller = RestoreProgressController(application=application)
+
+    def is_backup_file(self, file_path):
+        return re.match(pattern=RestoreModel.DEFAULT_MATCH_PATTERN, string=os.path.basename(file_path)) is not None
+
+    def is_legacy_backup_file(self, file_path):
+        return re.match(pattern=LegacyRestoreModel.DEFAULT_MATCH_PATTERN, string=os.path.basename(file_path)) is not None
+
+    def load(self):
+        # The list will be sorted with newest files first, with the group of legacy backup files appearing last.
+        self._view.files = RestoreModel.backup_files() + LegacyRestoreModel.backup_files()
+
+    def save(self):
+        # No file selected, so there's nothing to do.
+        if self._view.selected_file is None:
+            logger.error(msg='Failed to restore from a backup. File was not specified.')
+            raise FileNotFoundError(_('Failed to restore from a backup. File was not specified.'))
+
+        if re.match(pattern=RestoreModel.DEFAULT_MATCH_PATTERN, string=os.path.basename(self._view.selected_file)):
+            logger.info(msg="Restoring from backup file: {file_path}".format(file_path=self._view.selected_file))
+            self._restore_progress_controller.model = RestoreModel(backup_file_path=self._view.selected_file)
+
+        # Legacy backup file selected. Use the LegacyRestoreModel class.
+        elif re.match(pattern=LegacyRestoreModel.DEFAULT_MATCH_PATTERN, string=os.path.basename(self._view.selected_file)):
+            logger.info(msg="Restoring from legacy backup file: {file_path}".format(file_path=self._view.selected_file))
+            self._restore_progress_controller.model = LegacyRestoreModel(backup_file_path=self._view.selected_file)
+
+        else:
+            logger.error(msg="Failed to restore from an unsupported backup file: {file_path}".format(file_path=self._view.selected_file))
+            raise NotImplementedError(_("Failed to restore from an unsupported backup file: {file_path}").format(file_path=self._view.selected_file))
+
+        self.next(id=RestoreProgressController.FORM_ID)
+
+        try:
+            self._restore_progress_controller.save()
+
+            # Block Compliance Reporter port.
+            UFW.deny(application=SERVICES[Services.COMPLIANCE_REPORTER]['name'])
+        except Exception as e:
+            logger.error(msg=str(e))
+            process_view = self._application.widget(RestoreProgressController.FORM_ID)
+            process_view.open_confirmation_dialog(
+                title=_('Restore'),
+                message=str(e),
+                on_cancel=process_view.on_close_confirmation_dialog,
+                on_ok=process_view.on_cancel,
+                cancel_label=_('Back'),
+                ok_label=_('OK')
+            )
